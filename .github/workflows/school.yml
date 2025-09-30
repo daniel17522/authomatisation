@@ -9,10 +9,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # <<< ВАЖНО: укажи точное имя токена из папки tokens >>>
-    env:
-      GMAIL_TOKEN_FILENAME: token_skidlineg_at_gmail.com.pkl
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,9 +51,9 @@ jobs:
           GMAIL_TOKEN_B64: ${{ secrets.GMAIL_TOKEN_B64 }}
         run: |
           mkdir -p tokens
-          echo "$GMAIL_TOKEN_B64" | base64 -d > "tokens/${GMAIL_TOKEN_FILENAME}"
-          test -s "tokens/${GMAIL_TOKEN_FILENAME}" || { echo "::error::gmail token is empty"; exit 1; }
-          ls -la tokens
+          # ИМЯ ФАЙЛА ДОЛЖНО СОВПАДАТЬ С ТВОИМ PKL!
+          echo "$GMAIL_TOKEN_B64" | base64 -d > tokens/token_forschoolcalendar_at_gmail.com.pkl
+          test -s tokens/token_forschoolcalendar_at_gmail.com.pkl || { echo "::error::gmail token is empty"; exit 1; }
 
       - name: Run script
         env:
