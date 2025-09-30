@@ -9,10 +9,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    # <<< ВАЖНО: поменяй имя файла на свой токен из папки tokens >>>
     env:
-      # !!! УКАЖИ ИМЯ ФАЙЛА ТОКЕНА ПОД СВОЙ e-mail !!!
       GMAIL_TOKEN_FILENAME: token_forschoolcalendar_at_gmail.com.pkl
-      # варианты: token_skidlineg_at_gmail.com.pkl и т.п.
 
     steps:
       - name: Checkout
@@ -20,36 +19,6 @@ jobs:
 
       - name: Show UTC time
         run: date -u
-
-      - name: Print which branch & commit
-        run: |
-          echo "BRANCH: $GITHUB_REF"
-          echo "SHA:    $GITHUB_SHA"
-
-      - name: Validate required secrets exist
-        run: |
-          req=(OPENAI_API_KEY TELEGRAM_TOKEN CHAT_ID TARGET_GOOGLE_ACCOUNT LOOKBACK_DAYS CREDENTIALS_B64 GMAIL_TOKEN_B64)
-          missing=0
-          for k in "${req[@]}"; do
-            if [ -z "${!k}" ]; then
-              echo "::error::Missing secret: $k"
-              missing=1
-            else
-              echo "ok: $k is set"
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "::error::Add missing secrets in Settings → Secrets and variables → Actions"
-            exit 1
-          fi
-        env:
-          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
-          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID:              ${{ secrets.CHAT_ID }}
-          TARGET_GOOGLE_ACCOUNT:${{ secrets.TARGET_GOOGLE_ACCOUNT }}
-          LOOKBACK_DAYS:        ${{ secrets.LOOKBACK_DAYS }}
-          CREDENTIALS_B64:      ${{ secrets.CREDENTIALS_B64 }}
-          GMAIL_TOKEN_B64:      ${{ secrets.GMAIL_TOKEN_B64 }}
 
       - name: Install system deps (OCR/PDF)
         run: |
@@ -67,8 +36,6 @@ jobs:
           . venv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
-          python -V
-          pip freeze | sed -n '1,120p'
 
       - name: Restore processed_ids cache
         uses: actions/cache/restore@v4
@@ -82,38 +49,25 @@ jobs:
         run: |
           echo "$CREDENTIALS_B64" | base64 -d > credentials.json
           test -s credentials.json || { echo "::error::credentials.json is empty"; exit 1; }
-          echo "credentials.json restored ($(wc -c < credentials.json) bytes)"
 
       - name: Restore Gmail token (from base64)
         env:
           GMAIL_TOKEN_B64: ${{ secrets.GMAIL_TOKEN_B64 }}
         run: |
           mkdir -p tokens
-          echo "$GMAIL_TOKEN_B64" | base64 -d > "tokens/${GMAIL_TOKEN_FILENAME}"
-          test -s "tokens/${GMAIL_TOKEN_FILENAME}" || { echo "::error::Gmail token is empty"; exit 1; }
-          echo "token restored: tokens/${GMAIL_TOKEN_FILENAME} ($(wc -c < "tokens/${GMAIL_TOKEN_FILENAME}") bytes)"
+          echo "$GMAIL_TOKEN_B64" | base64 -d > "tokens/${token_skidlineg_at_gmail.com.pkl}"
+          test -s "tokens/${token_skidlineg_at_gmail.com.pkl}" || { echo "::error::gmail token is empty"; exit 1; }
           ls -la tokens
-
-      - name: Quick sanity checks (imports)
-        run: |
-          . venv/bin/activate
-          python - <<'PY'
-          import sys
-          print("python:", sys.version)
-          for m in ["googleapiclient.discovery","google_auth_oauthlib.flow","openai","PyPDF2","docx","PIL","pytesseract"]:
-              __import__(m)
-              print("ok import", m)
-          PY
 
       - name: Run script
         env:
-          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
-          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID:              ${{ secrets.CHAT_ID }}
-          TARGET_GOOGLE_ACCOUNT:${{ secrets.TARGET_GOOGLE_ACCOUNT }}
-          LOOKBACK_DAYS:        ${{ secrets.LOOKBACK_DAYS }}
-          LOG_LEVEL:            INFO
-          HEADLESS:             "1"
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID:               ${{ secrets.CHAT_ID }}
+          TARGET_GOOGLE_ACCOUNT: ${{ secrets.TARGET_GOOGLE_ACCOUNT }}
+          LOOKBACK_DAYS:         ${{ secrets.LOOKBACK_DAYS }}
+          LOG_LEVEL:             INFO
+          HEADLESS:              "1"
         run: |
           . venv/bin/activate
           python school_autho_egor.py --max=15
