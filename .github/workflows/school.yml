@@ -1,0 +1,82 @@
+name: school-cron
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # каждые 15 минут (UTC)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show UTC time
+        run: date -u
+
+      - name: Install system deps (OCR/PDF)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr poppler-utils
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m venv venv
+          . venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore processed_ids cache
+        uses: actions/cache/restore@v4
+        with:
+          path: processed_ids.json
+          key: processed-ids
+
+      - name: Restore credentials.json (from base64)
+        env:
+          CREDENTIALS_B64: ${{ secrets.CREDENTIALS_B64 }}
+        run: |
+          echo "$CREDENTIALS_B64" | base64 -d > credentials.json
+
+      - name: Restore Gmail token (from base64)
+        env:
+          GMAIL_TOKEN_B64: ${{ secrets.GMAIL_TOKEN_B64 }}
+        run: |
+          mkdir -p tokens
+          # ИМЯ ФАЙЛА ДОЛЖНО СОВПАДАТЬ С ЛОКАЛЬНЫМ!
+          echo "$GMAIL_TOKEN_B64" | base64 -d > tokens/token_skidlineg_at_gmail.com.pkl
+
+      - name: Run script
+        env:
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID:              ${{ secrets.CHAT_ID }}
+          TARGET_GOOGLE_ACCOUNT:${{ secrets.TARGET_GOOGLE_ACCOUNT }}
+          LOOKBACK_DAYS:        ${{ secrets.LOOKBACK_DAYS }}
+          LOG_LEVEL:            INFO
+          HEADLESS:             "1"
+        run: |
+          . venv/bin/activate
+          python school_autho_egor.py
+
+      - name: Save processed_ids cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: processed_ids.json
+          key: processed-ids
+
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: school-logs
+          path: logs/
+          if-no-files-found: ignore

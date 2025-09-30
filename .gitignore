@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+.env
+credentials.json
+token.pkl
+tokens/
+logs/
+processed_ids.json
+
+# venv / IDE
+venv*/
+.venv*/
+.idea/
+.vscode/
