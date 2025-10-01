@@ -150,35 +150,34 @@ def _token_path_for(email_hint: str | None) -> Path:
 
 def gmail_auth():
     token_path = _token_path_for(TARGET_GOOGLE_ACCOUNT or None)
+
     creds = None
-    if token_path.exists():
-        with open(token_path, "rb") as f: creds = pickle.load(f)
+    if os.path.exists(token_path):
+        with open(token_path, "rb") as f:
+            creds = pickle.load(f)
 
-    need_flow = not creds or not creds.valid
-    if creds and creds.expired and creds.refresh_token:
-        try: creds.refresh(Request())
-        except Exception: need_flow = True
-
-    if need_flow:
-        flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
-        if HEADLESS:
-            creds = flow.run_console()          # сервер/SSH
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
+            # В CI/Actions НЕЛЬЗЯ начинать интерактивный OAuth — там не будет браузера.
+            if os.environ.get("HEADLESS") == "1":
+                raise RuntimeError(
+                    f"No valid Gmail token at {token_path}. "
+                    "Upload your pickled token (*.pkl) via GMAIL_TOKEN_B64 secret."
+                )
+            # Локальный интерактивный OAuth (только на своей машине)
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
-        svc_tmp = build("gmail", "v1", credentials=creds)
-        profile = svc_tmp.users().getProfile(userId="me").execute()
-        email_addr = (profile.get("emailAddress") or "").strip()
-        token_path = _token_path_for(email_addr or TARGET_GOOGLE_ACCOUNT or None)
-        with open(token_path, "wb") as f: pickle.dump(creds, f)
 
-    try:
-        svc_tmp = build("gmail", "v1", credentials=creds)
-        profile = svc_tmp.users().getProfile(userId="me").execute()
-        print("👤 Google account:", profile.get("emailAddress"))
-    except Exception:
-        pass
+        # на всякий случай сохраняем обновлённые креды
+        os.makedirs(os.path.dirname(token_path), exist_ok=True)
+        with open(token_path, "wb") as f:
+            pickle.dump(creds, f)
 
     return build("gmail", "v1", credentials=creds)
+
 
 def build_school_gmail_query() -> str:
     after_date = (datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
