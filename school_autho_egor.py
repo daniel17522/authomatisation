@@ -1,4 +1,4 @@
-# school_autho_egor.py — ALL-IN-ONE, чистая версия
+# school_autho_egor.py — ALL-IN-ONE, фикс года по дате письма
 
 import os, re, json, base64, pickle, requests, builtins, logging, logging.handlers, sys
 from pathlib import Path
@@ -142,6 +142,9 @@ def _extract_text_from_payload(payload) -> str | None:
     return None
 
 # ---------- Gmail ----------
+import email.utils
+from email.utils import parsedate_to_datetime
+
 def _token_path_for(email_hint: str | None) -> Path:
     if email_hint:
         safe = email_hint.replace("@", "_at_")
@@ -167,9 +170,8 @@ def gmail_auth():
                     "Upload your pickled token (*.pkl) via GMAIL_TOKEN_B64 secret."
                 )
             # Локальный интерактивный OAuth (только на своей машине)
-            from google_auth_oauthlib.flow import InstalledAppFlow
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
 
         # на всякий случай сохраняем обновлённые креды
         os.makedirs(os.path.dirname(token_path), exist_ok=True)
@@ -177,7 +179,6 @@ def gmail_auth():
             pickle.dump(creds, f)
 
     return build("gmail", "v1", credentials=creds)
-
 
 def build_school_gmail_query() -> str:
     after_date = (datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
@@ -199,25 +200,55 @@ def get_email_with_attachments_by_id(service, msg_id: str):
     msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
     payload = msg.get("payload", {}) or {}
     headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-    subject = headers.get("subject", ""); sender = headers.get("from", "")
+
+    subject = headers.get("subject", "")
+    sender  = headers.get("from", "")
+
+    # ► дата письма (reference date)
+    ref_dt = None
+    if "date" in headers:
+        try:
+            ref_dt = parsedate_to_datetime(headers["date"])
+        except Exception:
+            ref_dt = None
+    if ref_dt is None:
+        try:
+            ref_dt = datetime.utcfromtimestamp(int(msg.get("internalDate", "0")) / 1000.0)
+        except Exception:
+            ref_dt = datetime.utcnow()
+    if getattr(ref_dt, "tzinfo", None) is not None:
+        ref_dt = ref_dt.replace(tzinfo=None)
+
     body_text = _extract_text_from_payload(payload) or msg.get("snippet","") or " "
+
     attachments = []
     def walk(p):
         for part in (p.get("parts") or []):
             filename = (part.get("filename") or "").strip()
             mime = part.get("mimeType") or ""
-            body = part.get("body", {}) or {}; att_id = body.get("attachmentId")
+            body = part.get("body", {}) or {}
+            att_id = body.get("attachmentId")
             if filename and att_id:
-                att = service.users().messages().attachments().get(userId="me", messageId=msg["id"], id=att_id).execute()
-                data_b64 = att.get("data",""); data_b64 += "=" * (-len(data_b64) % 4)
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=msg["id"], id=att_id
+                ).execute()
+                data_b64 = att.get("data","")
+                data_b64 += "=" * (-len(data_b64) % 4)
                 content = base64.urlsafe_b64decode(data_b64.encode("utf-8"))
                 attachments.append({"filename": filename, "mime": mime, "content": content})
-            if part.get("parts"): walk(part)
+            if part.get("parts"):
+                walk(part)
     walk(payload)
-    return {"subject": subject, "from": sender, "body": body_text, "attachments": attachments}
+
+    return {
+        "subject": subject,
+        "from": sender,
+        "body": body_text,
+        "attachments": attachments,
+        "ref_date": ref_dt.isoformat(),   # ← добавили
+    }
 
 # ---------- classify "school email" ----------
-import email.utils
 def _addr_domain(addr: str) -> str:
     _, email_addr = email.utils.parseaddr(addr)
     return email_addr.split("@",1)[1].lower() if "@" in email_addr else ""
@@ -321,7 +352,7 @@ def parse_event(text: str) -> dict:
     edt = _parse_dt(end_s) or def_end
     return {"title":title,"place":place,"desc":desc,"start":sdt.isoformat(),"end":edt.isoformat(),"price":price}
 
-# ---------- normalize dates ----------
+# ---------- normalize dates (фикс года по ref_date) ----------
 def _parse_iso(dt_s: str):
     if not dt_s: return None
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
@@ -330,13 +361,32 @@ def _parse_iso(dt_s: str):
     try: return datetime.fromisoformat(dt_s)
     except Exception: return None
 
-def normalize_event_times(event_data: dict, default_hours: int = 2) -> dict:
+def normalize_event_times(event_data: dict, default_hours: int = 2, ref_date: datetime | None = None) -> dict:
+    """
+    Приводим start/end к валидным и поднимаем год до "реальности":
+    - если end пуст/раньше start/слишком длинно — делаем end = start + default_hours
+    - если start сильно в прошлом относительно ref_date (или сейчас) — крутим год вперёд,
+      пока не станет в будущем (типичная ошибка "2023" вместо "2025").
+    """
     now = datetime.utcnow()
+    ref = ref_date or now
+
     start = _parse_iso(event_data.get("start")) or (now + timedelta(days=1)).replace(hour=10,minute=0,second=0,microsecond=0)
     end   = _parse_iso(event_data.get("end"))
-    if (not end) or (end <= start) or ((end - start).total_seconds() > 7*24*3600):
+
+    # если очень старое (старше чем на 1 день от реф. даты) — поднимаем год, сохраняя МДЧМ
+    if start < (ref - timedelta(days=1)):
+        for _ in range(5):  # защитный предел
+            start = start.replace(year=start.year + 1)
+            if start >= (ref - timedelta(days=1)):
+                break
+
+    # end приведём к валидному диапазону
+    if (not end) or (end <= start) or ((end - start).total_seconds() > 7 * 24 * 3600):
         end = start + timedelta(hours=default_hours)
-    event_data["start"]=start.isoformat(); event_data["end"]=end.isoformat()
+
+    event_data["start"]=start.isoformat()
+    event_data["end"]=end.isoformat()
     return event_data
 
 # ---------- Calendar ----------
@@ -441,8 +491,6 @@ def run_once():
     query = build_school_gmail_query()
     logger.info("🔎 Gmail query: %s", query)
 
-    # debug_list_recent(gmail_service, 15)  # при необходимости
-
     processed = 0; matched = 0; count = 0
     for msg_id in iter_message_ids(gmail_service, query, page_size=25, max_pages=10):
         if not REPROCESS_ALL and msg_id in processed_ids:
@@ -453,7 +501,16 @@ def run_once():
         matched += 1
 
         text_for_llm = build_email_text(email_obj)
-        event_data   = normalize_event_times(parse_event(text_for_llm))
+
+        # референсная дата = дата письма
+        ref_dt = None
+        try:
+            if email_obj.get("ref_date"):
+                ref_dt = datetime.fromisoformat(email_obj["ref_date"])
+        except Exception:
+            ref_dt = None
+
+        event_data   = normalize_event_times(parse_event(text_for_llm), ref_date=ref_dt)
         logger.info("📩 Распарсенные данные: %s", event_data)
 
         create_event(gmail_service, event_data)
