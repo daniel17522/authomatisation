@@ -1,4 +1,4 @@
-# school_autho_egor.py — ALL-IN-ONE, фикс года по дате письма
+# school_autho_egor.py — ALL-IN-ONE, with Gmail label-based dedup
 
 import os, re, json, base64, pickle, requests, builtins, logging, logging.handlers, sys
 from pathlib import Path
@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")  # грузим .env рядом со скриптом (если есть)
+load_dotenv(BASE_DIR / ".env")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -25,7 +25,7 @@ MAX_MESSAGES    = int(os.getenv("MAX_MESSAGES", "0"))
 TOKEN_DIR = BASE_DIR / "tokens"
 TOKEN_DIR.mkdir(exist_ok=True)
 
-# ---------- LOGGING (ротация + перехват print) ----------
+# ---------- LOGGING ----------
 LOG_DIR   = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE  = LOG_DIR / "school.log"
@@ -34,34 +34,44 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 def _setup_logging():
     logger = logging.getLogger("school")
     logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.handlers.TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=14, encoding="utf-8")
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                            "%Y-%m-%d %H:%M:%S")
+    fh = logging.handlers.TimedRotatingFileHandler(
+        LOG_FILE, when="midnight", interval=1, backupCount=14, encoding="utf-8"
+    )
     fh.setFormatter(fmt); logger.addHandler(fh)
     ch = logging.StreamHandler(); ch.setFormatter(fmt); logger.addHandler(ch)
+
     builtins._orig_print = print
     def _dual_print(*args, **kwargs):
         msg = " ".join(str(a) for a in args)
         logger.info(msg); builtins._orig_print(*args, **kwargs)
     builtins.print = _dual_print
     return logger
+
 logger = _setup_logging()
 
 def _tail(s: str, n: int = 6) -> str: return s[-n:] if s else ""
 def validate_env():
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY пуст — добавь в .env или Env Variables")
+        raise RuntimeError("OPENAI_API_KEY пуст — добавь в .env или Secrets/Env")
     print(f"🔑 OPENAI_API_KEY: ...{_tail(OPENAI_API_KEY)}")
     if TELEGRAM_TOKEN: print(f"🤖 TELEGRAM_TOKEN: ...{_tail(TELEGRAM_TOKEN)}")
     if CHAT_IDS: print(f"📨 CHAT_ID(s): {', '.join(CHAT_IDS)}")
+
 validate_env()
 
 # ---------- Gmail/Calendar scopes ----------
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.modify",  # для метки processed
 ]
 CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 PROCESSED_IDS_PATH = BASE_DIR / "processed_ids.json"
+
+# Имя метки, которой помечаем обработанные письма
+GMAIL_PROCESSED_LABEL = "school_processed"
 
 # ---------- School filters ----------
 SCHOOL_DOMAINS = [
@@ -142,9 +152,6 @@ def _extract_text_from_payload(payload) -> str | None:
     return None
 
 # ---------- Gmail ----------
-import email.utils
-from email.utils import parsedate_to_datetime
-
 def _token_path_for(email_hint: str | None) -> Path:
     if email_hint:
         safe = email_hint.replace("@", "_at_")
@@ -153,7 +160,6 @@ def _token_path_for(email_hint: str | None) -> Path:
 
 def gmail_auth():
     token_path = _token_path_for(TARGET_GOOGLE_ACCOUNT or None)
-
     creds = None
     if os.path.exists(token_path):
         with open(token_path, "rb") as f:
@@ -163,34 +169,55 @@ def gmail_auth():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # В CI/Actions НЕЛЬЗЯ начинать интерактивный OAuth — там не будет браузера.
-            if os.environ.get("HEADLESS") == "1":
+            if HEADLESS:
                 raise RuntimeError(
                     f"No valid Gmail token at {token_path}. "
-                    "Upload your pickled token (*.pkl) via GMAIL_TOKEN_B64 secret."
+                    "Нужен pkl-токен с новым scope gmail.modify (залей в GMAIL_TOKEN_B64)."
                 )
-            # Локальный интерактивный OAuth (только на своей машине)
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            creds = flow.run_local_server(port=0)
 
-        # на всякий случай сохраняем обновлённые креды
         os.makedirs(os.path.dirname(token_path), exist_ok=True)
         with open(token_path, "wb") as f:
             pickle.dump(creds, f)
 
     return build("gmail", "v1", credentials=creds)
 
+# --- Gmail label utils ---
+def _get_or_create_label(service, label_name: str) -> str:
+    lbls = service.users().labels().list(userId="me").execute().get("labels", [])
+    for lb in lbls:
+        if lb.get("name") == label_name:
+            return lb["id"]
+    body = {
+        "name": label_name,
+        "labelListVisibility": "labelShow",
+        "messageListVisibility": "show",
+    }
+    created = service.users().labels().create(userId="me", body=body).execute()
+    return created["id"]
+
+def mark_message_processed(service, msg_id: str, label_id: str):
+    service.users().messages().modify(
+        userId="me",
+        id=msg_id,
+        body={"addLabelIds": [label_id], "removeLabelIds": []},
+    ).execute()
+
 def build_school_gmail_query() -> str:
     after_date = (datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
     dom_q  = " OR ".join([f'from:({d})' for d in SCHOOL_DOMAINS])
-    kw_q   = " OR ".join([f'"{k}"' for k in SCHOOL_KEYWORDS])  # ищем везде (без subject:)
-    q = f'in:anywhere after:{after_date} ({dom_q} OR ({kw_q}))'
+    kw_q   = " OR ".join([f'"{k}"' for k in SCHOOL_KEYWORDS])
+    # исключаем письма уже отмеченные нашей меткой
+    q = f'in:anywhere -label:{GMAIL_PROCESSED_LABEL} after:{after_date} ({dom_q} OR ({kw_q}))'
     return q
 
 def iter_message_ids(service, q: str, page_size: int = 50, max_pages: int = 10):
     page_token = None; pages = 0
     while True:
-        resp = service.users().messages().list(userId="me", q=q, maxResults=page_size, pageToken=page_token).execute()
+        resp = service.users().messages().list(
+            userId="me", q=q, maxResults=page_size, pageToken=page_token
+        ).execute()
         for m in resp.get("messages", []) or []:
             yield m["id"]
         page_token = resp.get("nextPageToken"); pages += 1
@@ -200,55 +227,27 @@ def get_email_with_attachments_by_id(service, msg_id: str):
     msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
     payload = msg.get("payload", {}) or {}
     headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-
-    subject = headers.get("subject", "")
-    sender  = headers.get("from", "")
-
-    # ► дата письма (reference date)
-    ref_dt = None
-    if "date" in headers:
-        try:
-            ref_dt = parsedate_to_datetime(headers["date"])
-        except Exception:
-            ref_dt = None
-    if ref_dt is None:
-        try:
-            ref_dt = datetime.utcfromtimestamp(int(msg.get("internalDate", "0")) / 1000.0)
-        except Exception:
-            ref_dt = datetime.utcnow()
-    if getattr(ref_dt, "tzinfo", None) is not None:
-        ref_dt = ref_dt.replace(tzinfo=None)
-
+    subject = headers.get("subject", ""); sender = headers.get("from", "")
     body_text = _extract_text_from_payload(payload) or msg.get("snippet","") or " "
-
     attachments = []
     def walk(p):
         for part in (p.get("parts") or []):
             filename = (part.get("filename") or "").strip()
             mime = part.get("mimeType") or ""
-            body = part.get("body", {}) or {}
-            att_id = body.get("attachmentId")
+            body = part.get("body", {}) or {}; att_id = body.get("attachmentId")
             if filename and att_id:
                 att = service.users().messages().attachments().get(
                     userId="me", messageId=msg["id"], id=att_id
                 ).execute()
-                data_b64 = att.get("data","")
-                data_b64 += "=" * (-len(data_b64) % 4)
+                data_b64 = att.get("data",""); data_b64 += "=" * (-len(data_b64) % 4)
                 content = base64.urlsafe_b64decode(data_b64.encode("utf-8"))
                 attachments.append({"filename": filename, "mime": mime, "content": content})
-            if part.get("parts"):
-                walk(part)
+            if part.get("parts"): walk(part)
     walk(payload)
-
-    return {
-        "subject": subject,
-        "from": sender,
-        "body": body_text,
-        "attachments": attachments,
-        "ref_date": ref_dt.isoformat(),   # ← добавили
-    }
+    return {"subject": subject, "from": sender, "body": body_text, "attachments": attachments}
 
 # ---------- classify "school email" ----------
+import email.utils
 def _addr_domain(addr: str) -> str:
     _, email_addr = email.utils.parseaddr(addr)
     return email_addr.split("@",1)[1].lower() if "@" in email_addr else ""
@@ -294,7 +293,9 @@ def extract_text_from_attachment(att: dict) -> str:
     name = att["filename"].lower(); mime = att["mime"]; data = att["content"]
     if mime == "application/pdf" or name.endswith(".pdf"):
         return extract_text_from_pdf_bytes(data)
-    if (mime.startswith("application/vnd.openxmlformats") or name.endswith(".docx") or mime == "application/msword"):
+    if (mime.startswith("application/vnd.openxmlformats")
+        or name.endswith(".docx")
+        or mime == "application/msword"):
         try:
             doc = Document(BytesIO(data))
             return "\n".join(p.text for p in doc.paragraphs).strip()
@@ -335,6 +336,7 @@ def parse_event(text: str) -> dict:
         data = {}
 
     now = datetime.utcnow()
+    # если год не указан, даём текущий; если дата прошла — сдвигаем на следующий год
     def_start = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
     def_end   = def_start + timedelta(hours=2)
 
@@ -343,16 +345,31 @@ def parse_event(text: str) -> dict:
     start_s=_s(data.get("start")); end_s=_s(data.get("end")); price=_s(data.get("price"))
 
     def _parse_dt(s):
+        # Поддержка без-года: YYYY-MM-DDTHH:MM или MM-DDTHH:MM
+        if not s:
+            return None
+        # если пришло без года (например 10-01T09:00)
+        if re.fullmatch(r"\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?", s):
+            s = f"{now.year}-{s}"
         for f in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-            try: return datetime.strptime(s,f)
-            except ValueError: pass
+            try: 
+                dt = datetime.strptime(s,f)
+                # если дата уже прошла — сдвинем на следующий год
+                if dt < now:
+                    try_next = dt.replace(year=now.year)
+                    if try_next < now:
+                        try_next = try_next.replace(year=now.year+1)
+                    dt = try_next
+                return dt
+            except ValueError:
+                pass
         return None
 
     sdt = _parse_dt(start_s) or def_start
-    edt = _parse_dt(end_s) or def_end
+    edt = _parse_dt(end_s) or (sdt + timedelta(hours=2))
     return {"title":title,"place":place,"desc":desc,"start":sdt.isoformat(),"end":edt.isoformat(),"price":price}
 
-# ---------- normalize dates (фикс года по ref_date) ----------
+# ---------- normalize dates ----------
 def _parse_iso(dt_s: str):
     if not dt_s: return None
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
@@ -361,32 +378,15 @@ def _parse_iso(dt_s: str):
     try: return datetime.fromisoformat(dt_s)
     except Exception: return None
 
-def normalize_event_times(event_data: dict, default_hours: int = 2, ref_date: datetime | None = None) -> dict:
-    """
-    Приводим start/end к валидным и поднимаем год до "реальности":
-    - если end пуст/раньше start/слишком длинно — делаем end = start + default_hours
-    - если start сильно в прошлом относительно ref_date (или сейчас) — крутим год вперёд,
-      пока не станет в будущем (типичная ошибка "2023" вместо "2025").
-    """
+def normalize_event_times(event_data: dict, default_hours: int = 2) -> dict:
     now = datetime.utcnow()
-    ref = ref_date or now
-
-    start = _parse_iso(event_data.get("start")) or (now + timedelta(days=1)).replace(hour=10,minute=0,second=0,microsecond=0)
+    start = _parse_iso(event_data.get("start")) or (now + timedelta(days=1)).replace(
+        hour=10,minute=0,second=0,microsecond=0
+    )
     end   = _parse_iso(event_data.get("end"))
-
-    # если очень старое (старше чем на 1 день от реф. даты) — поднимаем год, сохраняя МДЧМ
-    if start < (ref - timedelta(days=1)):
-        for _ in range(5):  # защитный предел
-            start = start.replace(year=start.year + 1)
-            if start >= (ref - timedelta(days=1)):
-                break
-
-    # end приведём к валидному диапазону
-    if (not end) or (end <= start) or ((end - start).total_seconds() > 7 * 24 * 3600):
+    if (not end) or (end <= start) or ((end - start).total_seconds() > 7*24*3600):
         end = start + timedelta(hours=default_hours)
-
-    event_data["start"]=start.isoformat()
-    event_data["end"]=end.isoformat()
+    event_data["start"]=start.isoformat(); event_data["end"]=end.isoformat()
     return event_data
 
 # ---------- Calendar ----------
@@ -394,7 +394,10 @@ def event_exists(calendar_service, summary: str, start_iso: str) -> bool:
     s = datetime.fromisoformat(start_iso)
     time_min = (s - timedelta(minutes=15)).isoformat() + "Z"
     time_max = (s + timedelta(minutes=15)).isoformat() + "Z"
-    resp = calendar_service.events().list(calendarId="primary", q=summary, timeMin=time_min,timeMax=time_max, singleEvents=True, orderBy="startTime").execute()
+    resp = calendar_service.events().list(
+        calendarId="primary", q=summary, timeMin=time_min,timeMax=time_max,
+        singleEvents=True, orderBy="startTime"
+    ).execute()
     for it in (resp.get("items") or []):
         if (it.get("summary","").strip() == summary.strip()):
             return True
@@ -456,7 +459,7 @@ def send_telegram(event_data):
         except RequestException:
             logger.exception("Telegram: не удалось отправить сообщение (%s)", chat_id)
 
-# ---------- processed_ids ----------
+# ---------- processed_ids (backup) ----------
 def load_processed_ids() -> set:
     try:
         return set(json.loads(PROCESSED_IDS_PATH.read_text(encoding="utf-8")))
@@ -465,22 +468,13 @@ def load_processed_ids() -> set:
 
 def save_processed_ids(s: set):
     try:
-        PROCESSED_IDS_PATH.write_text(json.dumps(sorted(list(s))[-5000:]), encoding="utf-8")
+        PROCESSED_IDS_PATH.write_text(json.dumps(sorted(list(s))[-5000:]),
+                                      encoding="utf-8")
         logger.debug("💾 processed_ids: %d", len(s))
     except Exception:
         logger.exception("Не удалось сохранить processed_ids")
 
-# ---------- отладочный список последних писем (по желанию) ----------
-def debug_list_recent(service, limit: int = 15):
-    resp = service.users().messages().list(userId="me", maxResults=limit).execute()
-    ids = [m["id"] for m in resp.get("messages", [])]
-    print(f"🧪 Последние {len(ids)} писем в ящике:")
-    for mid in ids:
-        msg = service.users().messages().get(userId="me", id=mid, format="metadata", metadataHeaders=["From","Subject","Date"]).execute()
-        hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-        print(f"- From: {hdrs.get('From','')} | Subject: {hdrs.get('Subject','')}")
-
-# ---------- main (один проход) ----------
+# ---------- main ----------
 def run_once():
     processed_ids = load_processed_ids()
     if RESET_PROCESSED:
@@ -488,6 +482,8 @@ def run_once():
         logger.info("🧹 История processed_ids очищена по флагу")
 
     gmail_service = gmail_auth()
+    label_id = _get_or_create_label(gmail_service, GMAIL_PROCESSED_LABEL)
+
     query = build_school_gmail_query()
     logger.info("🔎 Gmail query: %s", query)
 
@@ -495,29 +491,29 @@ def run_once():
     for msg_id in iter_message_ids(gmail_service, query, page_size=25, max_pages=10):
         if not REPROCESS_ALL and msg_id in processed_ids:
             continue
+
         email_obj = get_email_with_attachments_by_id(gmail_service, msg_id)
         if not is_school_email(email_obj):
             continue
         matched += 1
 
         text_for_llm = build_email_text(email_obj)
-
-        # референсная дата = дата письма
-        ref_dt = None
-        try:
-            if email_obj.get("ref_date"):
-                ref_dt = datetime.fromisoformat(email_obj["ref_date"])
-        except Exception:
-            ref_dt = None
-
-        event_data   = normalize_event_times(parse_event(text_for_llm), ref_date=ref_dt)
+        event_data   = normalize_event_times(parse_event(text_for_llm))
         logger.info("📩 Распарсенные данные: %s", event_data)
 
+        # создание события и сообщение в TG
         create_event(gmail_service, event_data)
         send_telegram(event_data)
-        processed += 1
 
+        # анти-дубликаты
+        try:
+            mark_message_processed(gmail_service, msg_id, label_id)
+        except Exception:
+            logger.exception("Не удалось поставить метку на письмо %s", msg_id)
+
+        processed += 1
         processed_ids.add(msg_id)
+
         count += 1
         if MAX_MESSAGES and count >= MAX_MESSAGES:
             logger.info("⏸ Достигнут лимит MAX_MESSAGES=%d", MAX_MESSAGES)
@@ -532,12 +528,10 @@ def run_once():
 
 if __name__ == "__main__":
     try:
-        # CLI-флажки (удобно иногда)
         for arg in sys.argv[1:]:
             if arg == "--reprocess": REPROCESS_ALL = True
             if arg == "--reset-processed": RESET_PROCESSED = True
             if arg.startswith("--max="): MAX_MESSAGES = int(arg.split("=",1)[1])
-
         run_once()
     except Exception:
         logger.exception("Фатальная ошибка выполнения скрипта")
