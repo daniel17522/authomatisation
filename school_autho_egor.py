@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")  # .env рядом со скриптом
+LAST_SENT_PATH = BASE_DIR / "last_sent_events.json"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -723,6 +724,17 @@ def send_telegram(event_data):
         print("ℹ️ Telegram отключён (нет токена или chat_id)")
         return
 
+    # === антифлуд по содержимому ===
+    last_sent = load_last_sent()
+    fp = make_event_fingerprint(event_data)
+    now_ts = int(datetime.utcnow().timestamp())
+
+    if fp in last_sent:
+        # уже слали это же самое объявление <24ч назад
+        logger.info("⏭ Уже отправлялось в Telegram недавно, скипаю (fp=%s)", fp)
+        return
+
+    # формируем текст
     when_line = _pretty_dt_range(
         event_data["start"],
         event_data["end"],
@@ -745,12 +757,14 @@ def send_telegram(event_data):
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
+    success_any = False
     for chat_id in CHAT_IDS:
         payload = {"chat_id": chat_id, "text": text}
         try:
             r = requests.post(url, data=payload, timeout=15)
             if r.status_code == 200:
                 print(f"✅ Telegram → {chat_id}")
+                success_any = True
             else:
                 logger.warning(
                     "Telegram HTTP %s: %s",
@@ -762,6 +776,12 @@ def send_telegram(event_data):
                 "Telegram: не удалось отправить сообщение (%s)",
                 chat_id
             )
+
+    # если хотя бы в один чат успешно ушло — помечаем как отправленное
+    if success_any:
+        last_sent[fp] = now_ts
+        save_last_sent(last_sent)
+
 
 
 # ============ processed_ids + state (anti-dup) ============
@@ -788,6 +808,55 @@ def save_processed_ids(s: set):
         logger.debug("💾 processed_ids saved: %d", len(s))
     except Exception:
         logger.exception("Не удалось сохранить processed_ids")
+
+def load_last_sent() -> dict:
+    """
+    Читаем историю отправленных в ТГ событий.
+    Формат:
+    {
+      "<fingerprint>": 1698534000,  # unix time когда слали
+      ...
+    }
+    """
+    try:
+        if LAST_SENT_PATH.exists():
+            return json.loads(LAST_SENT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Не удалось прочитать last_sent_events.json")
+    return {}
+
+
+def save_last_sent(d: dict):
+    try:
+        # зачистим старые (>24ч назад)
+        now_ts = int(datetime.utcnow().timestamp())
+        fresh = {
+            k: v for (k, v) in d.items()
+            if now_ts - v < 24 * 3600
+        }
+        LAST_SENT_PATH.write_text(
+            json.dumps(fresh, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить last_sent_events.json")
+
+
+def make_event_fingerprint(event_data: dict) -> str:
+    """
+    Делаем 'отпечаток' события, чтобы понять:
+    это то же самое объявление или нет.
+
+    Берем title + start + краткое начало desc.
+    """
+    title = (event_data.get("title") or "").strip()
+    start = (event_data.get("start") or "").strip()
+    desc  = (event_data.get("desc") or "").strip()
+    desc_short = desc[:80]  # достаточно для сравнения
+
+    fp = f"{title}|{start}|{desc_short}"
+    return fp
+
 
 
 def load_state() -> dict:
