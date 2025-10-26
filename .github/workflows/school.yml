@@ -2,7 +2,7 @@ name: school-cron
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # каждые 15 минут (UTC)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -15,6 +15,16 @@ jobs:
 
       - name: Show UTC time
         run: date -u
+
+      # ВАЖНО: восстанавливаем локальный стейт (антиспам)
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            processed_ids.json
+            state.json
+            last_sent_events.json
+          key: school-state-cache
 
       - name: Install system deps (OCR/PDF)
         run: |
@@ -33,12 +43,6 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore processed_ids cache
-        uses: actions/cache/restore@v4
-        with:
-          path: processed_ids.json
-          key: processed-ids
-
       - name: Restore credentials.json (from base64)
         env:
           CREDENTIALS_B64: ${{ secrets.CREDENTIALS_B64 }}
@@ -51,7 +55,6 @@ jobs:
           GMAIL_TOKEN_B64: ${{ secrets.GMAIL_TOKEN_B64 }}
         run: |
           mkdir -p tokens
-          # ИМЯ ФАЙЛА ДОЛЖНО СОВПАДАТЬ С ТВОИМ PKL!
           echo "$GMAIL_TOKEN_B64" | base64 -d > tokens/token_forschoolcalendar_at_gmail.com.pkl
           test -s tokens/token_forschoolcalendar_at_gmail.com.pkl || { echo "::error::gmail token is empty"; exit 1; }
 
@@ -68,12 +71,15 @@ jobs:
           . venv/bin/activate
           python school_autho_egor.py --max=15
 
-      - name: Save processed_ids cache
+      - name: Save state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: processed_ids.json
-          key: processed-ids
+          path: |
+            processed_ids.json
+            state.json
+            last_sent_events.json
+          key: school-state-cache
 
       - name: Upload logs artifact
         if: always()
