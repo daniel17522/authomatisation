@@ -1,5 +1,3 @@
-# school_autho_egor.py — FULL VERSION with dedupe fix
-
 import os, re, json, base64, pickle, requests, builtins, logging, logging.handlers, sys
 from pathlib import Path
 from io import BytesIO
@@ -104,7 +102,7 @@ validate_env()
 # ============ CONSTANTS / PATHS ============
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",  # ← нужно для меток
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
@@ -112,6 +110,8 @@ CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 PROCESSED_IDS_PATH = BASE_DIR / "processed_ids.json"
 STATE_PATH = BASE_DIR / "state.json"
 
+# используем Gmail-метку, чтобы исключать уже обработанные письма между запусками
+PROCESSED_LABEL_NAME = "schoolbot/processed"
 
 # фильтр писем школы
 SCHOOL_DOMAINS = [
@@ -265,11 +265,34 @@ def gmail_auth():
     return svc
 
 
+def get_or_create_label(service, name: str) -> str:
+    """Возвращает ID метки Gmail, создаёт если нет."""
+    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    for lb in labels:
+        if lb.get("name") == name:
+            return lb["id"]
+    body = {
+        "name": name,
+        "labelListVisibility": "labelShow",
+        "messageListVisibility": "show",
+    }
+    return service.users().labels().create(userId="me", body=body).execute()["id"]
+
+
+def add_label_to_message(service, msg_id: str, label_id: str):
+    service.users().messages().modify(
+        userId="me",
+        id=msg_id,
+        body={"addLabelIds": [label_id], "removeLabelIds": []},
+    ).execute()
+
+
 def build_school_gmail_query() -> str:
     """
     Ищем письма за последние LOOKBACK_DAYS
     Ищем по доменам ИЛИ по ключевым словам (в тексте).
     Ищем везде (входящие, пересланные и т.д.) — in:anywhere.
+    Исключаем письма, уже помеченные нашей меткой.
     """
     after_date = (datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
 
@@ -277,7 +300,7 @@ def build_school_gmail_query() -> str:
     kw_q   = " OR ".join([f'"{k}"' for k in SCHOOL_KEYWORDS])  # ищем слова где угодно
 
     q = (
-        f'in:anywhere after:{after_date} '
+        f'in:anywhere after:{after_date} -label:"{PROCESSED_LABEL_NAME}" '
         f'({dom_q} OR ({kw_q}))'
     )
     return q
@@ -673,7 +696,6 @@ def create_event(gmail_service, event_data):
         },
     }
 
-    calendar_service
     calendar_service.events().insert(
         calendarId="primary",
         body=event
@@ -730,7 +752,6 @@ def send_telegram(event_data):
     now_ts = int(datetime.utcnow().timestamp())
 
     if fp in last_sent:
-        # уже слали это же самое объявление <24ч назад
         logger.info("⏭ Уже отправлялось в Telegram недавно, скипаю (fp=%s)", fp)
         return
 
@@ -844,18 +865,12 @@ def save_last_sent(d: dict):
 
 def make_event_fingerprint(event_data: dict) -> str:
     """
-    Делаем 'отпечаток' события, чтобы понять:
-    это то же самое объявление или нет.
-
-    Берем title + start + краткое начало desc.
+    Устойчивый отпечаток события для антифлуда в Telegram.
+    Берём title + start (до минут).
     """
     title = (event_data.get("title") or "").strip()
-    start = (event_data.get("start") or "").strip()
-    desc  = (event_data.get("desc") or "").strip()
-    desc_short = desc[:80]  # достаточно для сравнения
-
-    fp = f"{title}|{start}|{desc_short}"
-    return fp
+    start = (event_data.get("start") or "").strip()[:16]
+    return f"{title}|{start}"
 
 
 
@@ -922,6 +937,10 @@ def run_once():
     logger.info("🧭 last_internal_ts(current): %s", last_ts)
 
     gmail_service = gmail_auth()
+
+    # убедимся, что метка есть (получим её id)
+    label_id = get_or_create_label(gmail_service, PROCESSED_LABEL_NAME)
+
     query = build_school_gmail_query()
     logger.info("🔎 Gmail query: %s", query)
 
@@ -940,7 +959,7 @@ def run_once():
     ):
         logger.debug("🔎 message_id=%s", msg_id)
 
-        # антидубль слой 1: уже обработан по id
+        # антидубль слой 1: уже обработан по id (локально)
         if not REPROCESS_ALL and msg_id in processed_ids:
             logger.debug("⏭ уже обработан по id: %s", msg_id)
             continue
@@ -984,8 +1003,16 @@ def run_once():
 
         logger.info("📩 Распарсенные данные: %s", event_data)
 
-        create_event(gmail_service, event_data)
-        send_telegram(event_data)
+        # выполняем действия и в любом случае помечаем письмо, чтобы больше не обрабатывать
+        try:
+            create_event(gmail_service, event_data)
+            send_telegram(event_data)
+        finally:
+            try:
+                add_label_to_message(gmail_service, email_obj["id"], label_id)
+                logger.info("🏷️  Письмо помечено меткой %s", PROCESSED_LABEL_NAME)
+            except Exception:
+                logger.exception("Не удалось навесить метку на письмо %s", email_obj.get("id"))
 
         processed_ids.add(msg_id)
         save_processed_ids(processed_ids)  # сохраняем сразу на всякий
